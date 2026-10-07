@@ -187,7 +187,7 @@ namespace experimental {
 // row. `row_or_col` picks which one of them. Returns 0 if no hop could be measured.
 size_t get_number_of_available_routing_planes(
     const tt::tt_metal::distributed::MeshDevice& mesh_device, size_t cluster_axis, size_t row_or_col);
-}
+}  // namespace experimental
 
 /******************** Fabric Mux **********************/
 
@@ -416,6 +416,22 @@ void add_fabric_mux_v2_to_program(
 
 void add_fabric_mux_v2_to_program(
     tt::tt_metal::Program& program,
+    const FabricMuxV2Config& config,
+    const tt::tt_metal::CoreCoord& mux_logical_core,
+    const FabricNodeId& src_fabric_node_id,
+    const FabricNodeId& dst_fabric_node_id,
+    uint32_t link_idx,
+    tt::tt_metal::NOC forwarder_noc = tt::tt_metal::NOC::RISCV_0_default);
+
+void add_fabric_mux_v2_to_program(
+    tt::tt_metal::ProgramDescriptor& program,
+    const FabricMuxV2Config& config,
+    const tt::tt_metal::CoreCoord& mux_logical_core,
+    const std::vector<uint32_t>& downstream_sender_rt_args,
+    tt::tt_metal::NOC forwarder_noc = tt::tt_metal::NOC::RISCV_0_default);
+
+void add_fabric_mux_v2_to_program(
+    tt::tt_metal::ProgramDescriptor& program,
     const FabricMuxV2Config& config,
     const tt::tt_metal::CoreCoord& mux_logical_core,
     const FabricNodeId& src_fabric_node_id,

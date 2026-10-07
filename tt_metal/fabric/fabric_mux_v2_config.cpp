@@ -9,6 +9,7 @@
 #include <limits>
 #include <unordered_map>
 #include <tt-metalium/experimental/fabric/fabric.hpp>
+#include <tt-metalium/program_descriptors.hpp>
 #include <hostdevcommon/fabric_mux_v2_common.h>
 
 #include "impl/context/metal_context.hpp"
@@ -186,9 +187,8 @@ FabricMuxV2Config::FabricMuxV2Config(
 
     // A caller-supplied ceiling only ever tightens the bound; it can never license the map to run past the
     // physical end of L1.
-    const size_t l1_end_address = usable_l1_end_address == 0
-                                      ? physical_l1_end_address
-                                      : std::min(usable_l1_end_address, physical_l1_end_address);
+    const size_t l1_end_address =
+        usable_l1_end_address == 0 ? physical_l1_end_address : std::min(usable_l1_end_address, physical_l1_end_address);
     TT_FATAL(
         memory_map_end_address_ <= l1_end_address,
         "FabricMuxV2 memory map end address {} exceeds usable worker L1 end address {} (physical L1 end: {})",
@@ -302,6 +302,77 @@ void add_fabric_mux_v2_to_program(
         mux_logical_core,
         forwarder_runtime_args,
         CoreType::WORKER);
+    add_fabric_mux_v2_to_program(program, config, mux_logical_core, forwarder_runtime_args, forwarder_noc);
+}
+
+void add_fabric_mux_v2_to_program(
+    tt::tt_metal::ProgramDescriptor& program,
+    const FabricMuxV2Config& config,
+    const tt::tt_metal::CoreCoord& mux_logical_core,
+    const std::vector<uint32_t>& downstream_sender_rt_args,
+    tt::tt_metal::NOC forwarder_noc) {
+    const auto manager_noc = get_manager_noc_from_forwarder_noc(forwarder_noc);
+    auto named_compile_args = config.get_fabric_mux_v2_named_compile_time_args();
+
+    auto allocate_semaphore = [&]() {
+        auto sem_id = program.find_available_semaphore_id(mux_logical_core, tt::tt_metal::CoreType::WORKER);
+        TT_FATAL(sem_id.has_value(), "No available semaphore ID for fabric mux v2 on {}", mux_logical_core.str());
+        program.semaphores.push_back(tt::tt_metal::SemaphoreDescriptor{
+            .id = sem_id.value(),
+            .core_type = tt::tt_metal::CoreType::WORKER,
+            .core_ranges = tt::tt_metal::CoreRangeSet(tt::tt_metal::CoreRange(mux_logical_core, mux_logical_core)),
+            .initial_value = 0,
+        });
+        return sem_id.value();
+    };
+    named_compile_args["fabric_mux_v2_forwarder_ready_sem_id"] = allocate_semaphore();
+    named_compile_args["fabric_mux_v2_manager_init_done_sem_id"] = allocate_semaphore();
+
+    auto push_mux_kernel = [&](tt::tt_metal::DataMovementProcessor processor,
+                               tt::tt_metal::NOC noc,
+                               bool with_runtime_args) {
+        tt::tt_metal::KernelDescriptor kernel;
+        kernel.kernel_source = kFabricMuxV2KernelPath;
+        kernel.source_type = tt::tt_metal::KernelDescriptor::SourceType::FILE_PATH;
+        kernel.core_ranges = tt::tt_metal::CoreRangeSet(tt::tt_metal::CoreRange(mux_logical_core, mux_logical_core));
+        kernel.named_compile_time_args.reserve(named_compile_args.size());
+        for (const auto& [name, value] : named_compile_args) {
+            kernel.named_compile_time_args.emplace_back(name, value);
+        }
+        kernel.opt_level = tt::tt_metal::KernelBuildOptLevel::O3;
+        kernel.config = tt::tt_metal::DataMovementConfigDescriptor{
+            .processor = processor,
+            .noc = noc,
+            .noc_mode = tt::tt_metal::NOC_MODE::DM_DEDICATED_NOC,
+        };
+        if (with_runtime_args) {
+            tt::tt_metal::KernelDescriptor::RTArgList runtime_args;
+            runtime_args.append(downstream_sender_rt_args);
+            kernel.emplace_runtime_args(mux_logical_core, runtime_args);
+        }
+        program.kernels.push_back(std::move(kernel));
+    };
+    push_mux_kernel(tt::tt_metal::DataMovementProcessor::RISCV_0, forwarder_noc, true);
+    push_mux_kernel(tt::tt_metal::DataMovementProcessor::RISCV_1, manager_noc, false);
+}
+
+void add_fabric_mux_v2_to_program(
+    tt::tt_metal::ProgramDescriptor& program,
+    const FabricMuxV2Config& config,
+    const tt::tt_metal::CoreCoord& mux_logical_core,
+    const FabricNodeId& src_fabric_node_id,
+    const FabricNodeId& dst_fabric_node_id,
+    uint32_t link_idx,
+    tt::tt_metal::NOC forwarder_noc) {
+    std::vector<uint32_t> forwarder_runtime_args;
+    append_fabric_connection_rt_args(
+        src_fabric_node_id,
+        dst_fabric_node_id,
+        link_idx,
+        program,
+        mux_logical_core,
+        forwarder_runtime_args,
+        tt::tt_metal::CoreType::WORKER);
     add_fabric_mux_v2_to_program(program, config, mux_logical_core, forwarder_runtime_args, forwarder_noc);
 }
 

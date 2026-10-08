@@ -141,6 +141,13 @@ jobs:
           wheel-artifact-name: ${{ inputs.wheel-artifact-name }}
           env-from-image: ${{ inputs.prebuilt-image != '' }}
           enable-llk-asserts: ${{ inputs.enable-llk-asserts }}
+      - name: Mcast C++ tests
+        if: ${{ matrix.test-group.category == 'kernel_lib' }}
+        timeout-minutes: 2
+        uses: ./docker-job/.github/actions/run-with-log
+        with:
+          log-file: generated/test_logs/mcast-cpp.log
+          run: build/test/ttnn/unit_tests_ttnn --gtest_filter='Mcast*'
       - name: ${{ matrix.test-group.name }}
         timeout-minutes: ${{ matrix.test-group.timeout }}
         uses: ./docker-job/.github/actions/run-with-log

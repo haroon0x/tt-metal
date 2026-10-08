@@ -33,6 +33,14 @@ pytest models/demos/gemma4_d_p/demo/text_demo_prefill.py::test_prefill_layer_per
 
 Both tests support chunk sizes 4096, 8192, 16384, and 32768. A CP-local chunk must cover the 1024-token sliding window, so 4096 skips on 8×4. Layer tests compile and capture once per layer type, initialize the ring caches with random values, and measure each selected chunk once.
 
+### Prefill perf gate in CI
+
+The **Blaze Models Prefill tests** workflow runs `tests/test_perf_glx.py` as the `gemma4_d_p_perf` stage on a 14kW Galaxy, 8×4. Dispatch it with `test-type=gemma4_d_p_perf`; the `gemma4_d_p` tag and nightly runs include it. In one process, with each cached weight written to the device once (as in `test_prefill_chunk_sweep_traced`), it runs a traced 256k prefill at chunk sizes 2048, 4096 and 8192, and fails if the wall time to reach 1k, 10k, 100k or 256k context exceeds its entry in `WALL_MS_BASELINES` by more than its margin in `WALL_MS_MARGINS`. Wall time is the `[traced_perf] context wall times` table: host staging, trace dispatch and the wait for the device, excluding compile and capture, rounded up to whole chunks.
+
+```bash
+pytest models/demos/gemma4_d_p/tests/test_perf_glx.py -sv
+```
+
 ### Layer perf in CI
 
 The **Blaze Models Prefill tests** workflow runs the `gemma4_d_p_layer_perf` stage with Tracy on a 14kW Galaxy. Dispatch it with `test-type=gemma4_d_p_layer_perf`; the regular nightly callers exclude this group. It measures `chunk_idx=ci`, which covers the cells in `LAYER_PERF_CI_CELLS`: the global layer at chunks 0, 1, 15, and 31, and the sliding layer at chunks 0 and 1, all at 256k@8k on 8×4. The job summary shows device-kernel time, span, and host time for each cell, plus each cell's full `tt-perf-report` output: the op table, advice, and stacked summary. The gap before each device's first replayed op is idle time before the replay, so it is left out of span and of `tt-perf-report`'s totals. The `layer-perf-*` artifact holds the raw `ops_perf_results_*.csv` and, for each cell, the slice of it that was reported (`*_ops.csv`) with `tt-perf-report`'s CSV, text output, stacked CSV/PNG, and log.

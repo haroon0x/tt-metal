@@ -13,6 +13,7 @@
 
 #include <tt_stl/assert.hpp>
 #include <tt_stl/span.hpp>
+#include <tt_stl/fmt.hpp>
 #include <tt-logger/tt-logger.hpp>
 
 #include <tt-metalium/bfloat16.hpp>

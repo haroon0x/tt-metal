@@ -19,7 +19,6 @@
 #include <utility>
 #include <vector>
 #include <optional>
-#include <tt-metalium/kernel_types.hpp>
 #include <hostdevcommon/fabric_common.h>
 
 namespace tt::tt_metal {

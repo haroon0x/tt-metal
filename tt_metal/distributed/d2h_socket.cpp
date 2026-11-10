@@ -161,7 +161,7 @@ D2HSocket::PinnedBufferInfo D2HSocket::init_host_buffer_hugepage(const std::shar
     auto device_id = device->id();
     auto& sysmem_mgr = device->sysmem_manager();
 
-    auto [data_host_ptr, data_dev_addr] = sysmem_mgr.allocate_region(fifo_size_);
+    auto [data_host_ptr, data_dev_addr] = sysmem_mgr.aux_region_allocator().allocate(fifo_size_);
     hugepage_data_host_ptr_ = static_cast<uint32_t*>(data_host_ptr);
     std::memset(hugepage_data_host_ptr_, 0, fifo_size_);
 
@@ -393,7 +393,7 @@ void D2HSocket::init_common(const std::shared_ptr<MeshDevice>& mesh_device) {
 
         auto* device = internal::get_device(*mesh_device, sender_core_.device_coord);
         auto& sysmem_mgr = device->sysmem_manager();
-        auto [bs_host_ptr, bs_dev_addr] = sysmem_mgr.allocate_region(sizeof(uint32_t));
+        auto [bs_host_ptr, bs_dev_addr] = sysmem_mgr.aux_region_allocator().allocate(sizeof(uint32_t));
         hugepage_bytes_sent_host_ptr_ = static_cast<volatile uint32_t*>(bs_host_ptr);
         *const_cast<uint32_t*>(hugepage_bytes_sent_host_ptr_) = 0;
 

@@ -7,9 +7,8 @@
 // needed for private members
 #include "aux_region_allocator.hpp"
 #include "command_sink.hpp"
+#include "cq_backing.hpp"
 #include "system_memory_cq_interface.hpp"
-#include <tt-umd/io_window/io_window.hpp>  // for tt::umd::IoWindow
-#include <tt-umd/types/xy_pair.hpp>        // for tt_cxy_pair
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -88,52 +87,29 @@ public:
 
     void fetch_queue_write(uint32_t command_size_B, uint8_t cq_id, bool stall_prefetcher = false);
 
-    bool is_dram_backed() const { return is_dram_backed_; }
+    bool is_dram_backed() const { return backing_->is_dram_backed(); }
 
     uint32_t get_dram_region_base_addr() const;
 
     uint32_t get_dram_region_bank_id() const;
 
     // Device-visible host memory after the CQ buffers, for consumers such as the D2H socket hugepage fallback.
-    AuxRegionAllocator& aux_region_allocator() { return aux_region_allocator_; }
+    AuxRegionAllocator& aux_region_allocator() { return backing_->aux_region_allocator(); }
 
 private:
-    bool is_mock_device() const { return is_mock_device_; }
-
-    void init_dispatch_core_interfaces(uint8_t num_hw_cqs, uint16_t channel);
-
     void send_completion_queue_read_ptr(uint8_t cq_id) const;
 
     MetalEnvImpl& env_;
     MetalContext& ctx_;
-    // Fixed for the lifetime of the device, so resolved once here instead of on every queue operation.
-    const bool is_mock_device_;
-    const bool is_dram_backed_;
-    // Alignment of issue queue entries: DRAM alignment for DRAM-backed CQs, host alignment otherwise.
-    const uint32_t cq_alignment_;
     ChipId device_id = 0;
-    std::vector<uint32_t> completion_byte_addrs;
-    char* cq_sysmem_start = nullptr;
+    // Hugepage, DRAM staging or mock, chosen once here; the queue code below doesn't check the mode.
+    std::unique_ptr<CqBacking> backing_;
     std::vector<SystemMemoryCQInterface> cq_interfaces;
-    uint32_t cq_size = 0;
-    uint32_t channel_offset = 0;
     struct CqEventProgress {
         std::atomic<uint32_t> last_issued{0};
         std::atomic<uint32_t> last_completed{0};
     };
     std::unique_ptr<CqEventProgress[]> cq_events_;
-    std::vector<tt_cxy_pair> prefetcher_cores;
-    std::vector<std::unique_ptr<tt::umd::IoWindow>> prefetch_q_windows;
-    std::vector<std::unique_ptr<tt::umd::IoWindow>> completion_q_windows;
-    std::vector<uint32_t> prefetch_q_dev_ptrs;
-    std::vector<uint32_t> prefetch_q_dev_fences;
-    // Phase bit value for the current lap of each fetch queue, used when the prefetcher polls it through its cache.
-    std::vector<uint32_t> prefetch_q_phases;
-
-    std::unique_ptr<char[]> dram_region_staging_buffer;
-
-    // Tail of CQ sysmem after all per-CQ issue/completion buffers; empty on mock devices.
-    AuxRegionAllocator aux_region_allocator_;
 };
 
 // Command sink for one CQ of a SystemMemoryManager: writes go to the device's CQ in system memory.

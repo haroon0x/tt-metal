@@ -87,12 +87,24 @@ AGMM_BLOCK_SIZES: dict[tuple[int, int, int], tuple[int, int, int]] = {
 }
 
 
-# Blocking of the dynamic-length path per (K, N) layer and length class; to_qkv and to_out take one
-# blocking at every length, ff1 one per class.
-AGMM_PINNED_BLOCKING: dict[tuple[int, int], dict[str, tuple[int, int, int]]] = {
-    (5376, 5376): {"short": (4, 6, 16), "long": (4, 6, 16)},
-    (5376, 7168): {"short": (6, 3, 16), "long": (4, 3, 16)},
-    (7168, 1344): {"short": (6, 8, 6), "long": (6, 8, 6)},
+# Blocking of the dynamic-length path per device compute grid, (K, N) layer and length class; to_qkv and to_out
+# take one blocking at every length on Blackhole, ff1 one per class.
+_BH_GRID = (12, 10)
+_WH_GRID = (8, 9)
+AGMM_PINNED_BLOCKING: dict[tuple[int, int], dict[tuple[int, int], dict[str, tuple[int, int, int]]]] = {
+    _BH_GRID: {
+        (5376, 5376): {"short": (4, 6, 16), "long": (4, 6, 16)},
+        (5376, 7168): {"short": (6, 3, 16), "long": (4, 3, 16)},
+        (7168, 1344): {"short": (6, 8, 6), "long": (6, 8, 6)},
+    },
+    # Wormhole 4x8 galaxy, transposed 8x8 worker grid, 4 links: the fused AGMM blockings swept per layer at 4736
+    # (short), 9184 and 13664 (long) rows/device. Each long pin is within 2.1 % of the best blocking at both long
+    # lengths (the bests: to_qkv (12, 7, 8) at 9184, (8, 7, 12) at 13664; ff1 (12, 7, 8), (8, 6, 10)).
+    _WH_GRID: {
+        (5376, 5376): {"short": (10, 7, 8), "long": (8, 7, 12)},
+        (5376, 7168): {"short": (10, 7, 10), "long": (10, 7, 10)},
+        (7168, 1344): {"short": (10, 8, 6), "long": (12, 8, 6)},
+    },
 }
 
 
@@ -104,28 +116,32 @@ class AgmmPin(NamedTuple):
     transpose_core_grid: bool
 
 
-# Worker-grid orientation per layer, measured on 4x8 Blackhole: to_qkv non-transposed is 21 % faster
-# at 15 s than the transposed grid the op's `M > N` rule picks there, ff1 matches, to_out (N < M) transposed.
-AGMM_PINNED_TRANSPOSED: dict[tuple[int, int], bool] = {
-    (5376, 5376): False,
-    (5376, 7168): False,
-    (7168, 1344): True,
+# Worker-grid orientation per layer. Blackhole 4x8: to_qkv non-transposed is 21 % faster at 15 s than the
+# transposed grid the op's `M > N` rule picks there, ff1 matches, to_out (N < M) transposed. Wormhole 4x8: every
+# layer transposed; to_qkv and ff1 non-transposed make the block 4 % slower at 4736 rows/device and 3.6 % at 13664.
+AGMM_PINNED_TRANSPOSED: dict[tuple[int, int], dict[tuple[int, int], bool]] = {
+    _BH_GRID: {(5376, 5376): False, (5376, 7168): False, (7168, 1344): True},
+    _WH_GRID: {(5376, 5376): True, (5376, 7168): True, (7168, 1344): True},
 }
 
 
 def agmm_pins(k: int, n: int, *, full_grid: ttnn.CoreCoord, num_links: int) -> dict[str, AgmmPin]:
     """The AGMM program of a `(K, N)` layer per length class: one worker-grid orientation at every length and
     the class's `AGMM_PINNED_BLOCKING`; classes with the same blocking share one pin."""
-    if (k, n) not in AGMM_PINNED_BLOCKING:
+    grid_key = (full_grid.x, full_grid.y)
+    if grid_key not in AGMM_PINNED_BLOCKING:
+        raise ValueError(f"dynamic_length has no pinned AGMM blockings for the {grid_key} compute grid")
+    blockings = AGMM_PINNED_BLOCKING[grid_key]
+    if (k, n) not in blockings:
         raise ValueError(f"dynamic_length has no pinned AGMM blocking for (K, N)={(k, n)}; TP=4 layouts only")
-    transposed = AGMM_PINNED_TRANSPOSED[(k, n)]
+    transposed = AGMM_PINNED_TRANSPOSED[grid_key][(k, n)]
     grid = agmm_worker_grid(full_grid, transposed, num_links)
     # in0 senders group along the M-parallel axis (grid.x transposed, grid.y not) into `num_links` groups.
     in0_axis = grid.x if transposed else grid.y
     workers = math.ceil(in0_axis / num_links)
     pins: dict[tuple[int, int, int], AgmmPin] = {}
     for cls in LENGTH_CLASSES:
-        blocking = AGMM_PINNED_BLOCKING[(k, n)][cls.name]
+        blocking = blockings[(k, n)][cls.name]
         if blocking not in pins:
             m_block, k_block, n_block = blocking
             config = ttnn.MinimalMatmulConfig(
@@ -137,7 +153,7 @@ def agmm_pins(k: int, n: int, *, full_grid: ttnn.CoreCoord, num_links: int) -> d
                 compute_with_storage_grid_size=grid,
             )
             pins[blocking] = AgmmPin(config, workers, transposed)
-    return {cls.name: pins[AGMM_PINNED_BLOCKING[(k, n)][cls.name]] for cls in LENGTH_CLASSES}
+    return {cls.name: pins[blockings[(k, n)][cls.name]] for cls in LENGTH_CLASSES}
 
 
 def agmm_kwargs(pins: dict[str, AgmmPin] | None, k: int, n: int, rows: int) -> dict:

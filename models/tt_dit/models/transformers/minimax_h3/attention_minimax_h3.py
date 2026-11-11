@@ -22,9 +22,14 @@ from ....utils.tensor import bf16_tensor
 from .agmm_config import agmm_kwargs, agmm_pins
 from .length_classes import LENGTH_CLASSES, length_class
 
-# Ring SDPA chunk pair of the dynamic-length path per length class, one program each. Measured per block
-# on 4x8: (320, 384) is 5 % faster at 4736 rows/device, (256, 512) 5 % faster at 13664.
-DYNAMIC_RING_SDPA_CHUNKS: dict[str, tuple[int, int]] = {"short": (320, 384), "long": (256, 512)}
+# Ring SDPA chunk pair of the dynamic-length path per device compute grid and length class, one program each.
+# Blackhole 4x8, measured per block: (320, 384) is 5 % faster at 4736 rows/device, (256, 512) 5 % faster at 13664.
+# Wormhole 4x8, ring SDPA alone: (256, 512) is the best pair at 4736 rows/device (25.7 ms vs 26.9 for (320, 384)) and at
+# 13664 (175.4 ms vs 181.0 for (256, 384)), so both classes share one program.
+DYNAMIC_RING_SDPA_CHUNKS: dict[tuple[int, int], dict[str, tuple[int, int]]] = {
+    (12, 10): {"short": (320, 384), "long": (256, 512)},
+    (8, 9): {"short": (256, 512), "long": (256, 512)},
+}
 
 
 def rope_channel_permutation(head_dim: int, rotary_dim: int) -> torch.Tensor:
@@ -207,11 +212,12 @@ class MiniMaxH3Attention(Module):
             self._qkv_pins = agmm_pins(hidden_size, 3 * self.inner_dim // tp_factor, **pin_kwargs)
             self._out_pins = agmm_pins(self.inner_dim, hidden_size // tp_factor, **pin_kwargs)
         if dynamic_length and self.use_ring:
+            chunks = DYNAMIC_RING_SDPA_CHUNKS[(full_grid.x, full_grid.y)]
             self._ring_sdpa_configs = {
                 cls.name: ttnn.SDPAProgramConfig(
                     compute_with_storage_grid_size=ttnn.CoreCoord(*self.sdpa_worker_grid),
-                    q_chunk_size=DYNAMIC_RING_SDPA_CHUNKS[cls.name][0],
-                    k_chunk_size=DYNAMIC_RING_SDPA_CHUNKS[cls.name][1],
+                    q_chunk_size=chunks[cls.name][0],
+                    k_chunk_size=chunks[cls.name][1],
                     exp_approx_mode=False,
                 )
                 for cls in LENGTH_CLASSES

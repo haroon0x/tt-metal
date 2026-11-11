@@ -177,7 +177,9 @@ class MiniMaxH3TransformerBlock(Module):
         if dynamic_length:
             grid = mesh_device.compute_with_storage_grid_size()
             if self.use_fused_agmm:
-                self._ff1_pins = agmm_pins(*self._ff1_kn, full_grid=grid, num_links=ccl_manager.num_links)
+                self._ff1_pins = agmm_pins(
+                    *self._ff1_kn, full_grid=grid, num_links=ccl_manager.num_links, arch=mesh_device.arch()
+                )
             if self.tp_factor > 1 and ccl_manager.topology == ttnn.Topology.Ring:
                 self._mmrs_pin = pinned_mmrs_config(ffn_dim // self.tp_factor, hidden_size, grid)
         # The dynamic-length modulation gathers: one-hot [rows, 32] @ table [32, hidden_local] through
@@ -452,8 +454,11 @@ class MiniMaxH3TransformerBlock(Module):
         return ttnn.addcmul(residual, ff_out, modulation(_GATE_MLP))
 
     def _ff1_kwargs(self, normed: ttnn.Tensor) -> dict:
-        """ff1's blocking kwargs on the fused all-gather matmul (class pin, else the length-keyed swept table);
-        none on the unfused path, whose matmul overruns L1 with the swept blockings at long sequence lengths."""
+        """ff1's blocking and compute kwargs on the fused all-gather matmul (class pin, else the length-keyed swept
+        table); none on the unfused path, whose matmul overruns L1 with the swept blockings at long sequence
+        lengths. ff2 keeps `mm_compute_kernel_config`."""
         if not self.use_fused_agmm:
             return {}
-        return agmm_kwargs(self._ff1_pins, *self._ff1_kn, normed.padded_shape[-2])
+        kwargs = agmm_kwargs(self._ff1_pins, *self._ff1_kn, normed.padded_shape[-2], self.mm_compute_kernel_config)
+        kwargs["ff1_compute_kernel_config"] = kwargs.pop("compute_kernel_config")
+        return kwargs

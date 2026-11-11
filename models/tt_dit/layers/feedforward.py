@@ -123,6 +123,7 @@ class ParallelFeedForward(Module):
         matmul_config=None,
         num_workers_per_link=None,
         transpose_core_grid: bool | None = None,
+        ff1_compute_kernel_config=None,
     ) -> ttnn.Tensor:
         """
         Expects x to be replicated.
@@ -130,11 +131,12 @@ class ParallelFeedForward(Module):
 
         `default_block_size`, `force_transpose` and the frozen `matmul_config` / `num_workers_per_link` /
         `transpose_core_grid` are forwarded to ff1 only, for callers that have measured block sizes for their
-        ff1 shape; ff2 keeps the generic path.
+        ff1 shape; ff2 keeps the generic path. `ff1_compute_kernel_config`, when given, replaces
+        `compute_kernel_config` for ff1 only (e.g. fp32 dest off with an 8-tile subblock while ff2 keeps fp32 dest).
         """
         ff1_out = self.ff1(
             x,
-            compute_kernel_config=compute_kernel_config,
+            compute_kernel_config=ff1_compute_kernel_config or compute_kernel_config,
             parallel_config=parallel_config,
             default_block_size=default_block_size,
             force_transpose=force_transpose,
@@ -163,6 +165,7 @@ class ParallelFeedForward(Module):
         num_workers_per_link=None,
         transpose_core_grid: bool | None = None,
         mmrs_config=None,
+        ff1_compute_kernel_config=None,
     ) -> ttnn.Tensor:
         """Fused FFN forward with addcmul fused at the RS final write step.
 
@@ -170,12 +173,12 @@ class ParallelFeedForward(Module):
         Both addcmul_a and addcmul_b are already at their per-TP-device [D/tp] slice —
         no AllGather or scatter matmul is required.
 
-        `default_block_size`, `force_transpose` and the frozen ff1 config go to ff1 only, as in `forward`;
-        `mmrs_config` is ff2's frozen fused MM+RS blocking.
+        `default_block_size`, `force_transpose`, the frozen ff1 config and `ff1_compute_kernel_config` go to
+        ff1 only, as in `forward`; `mmrs_config` is ff2's frozen fused MM+RS blocking.
         """
         ff1_out = self.ff1(
             x,
-            compute_kernel_config=compute_kernel_config,
+            compute_kernel_config=ff1_compute_kernel_config or compute_kernel_config,
             parallel_config=parallel_config,
             default_block_size=default_block_size,
             core_grid=core_grid,

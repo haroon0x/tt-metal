@@ -208,7 +208,7 @@ class MiniMaxH3Attention(Module):
         # Dynamic-length pins per length class, resolved once: no table scan and no orientation flip per call.
         self._qkv_pins = self._out_pins = self._ring_sdpa_configs = None
         if dynamic_length and self.use_fused_agmm:
-            pin_kwargs = dict(full_grid=full_grid, num_links=ccl_manager.num_links)
+            pin_kwargs = dict(full_grid=full_grid, num_links=ccl_manager.num_links, arch=mesh_device.arch())
             self._qkv_pins = agmm_pins(hidden_size, 3 * self.inner_dim // tp_factor, **pin_kwargs)
             self._out_pins = agmm_pins(self.inner_dim, hidden_size // tp_factor, **pin_kwargs)
         if dynamic_length and self.use_ring:
@@ -545,7 +545,6 @@ class MiniMaxH3Attention(Module):
 
         q_1BNF, k_1BNF, v_1BNF = self.to_qkv(
             spatial_1BND,
-            compute_kernel_config=self.mm_compute_kernel_config,
             parallel_config=matmul_parallel_config,
             force_transpose=False,
             use_persistent_buffer=self.use_persistent_ccl_buffers,
@@ -663,7 +662,6 @@ class MiniMaxH3Attention(Module):
         fuse_gate = addcmul_residual is not None and self.use_fused_agmm
         out = self.to_out(
             spatial_1BND,
-            compute_kernel_config=self.mm_compute_kernel_config,
             parallel_config=matmul_parallel_config,
             force_transpose=False,
             addcmul_a=addcmul_residual if fuse_gate else None,
@@ -676,11 +674,12 @@ class MiniMaxH3Attention(Module):
         return out
 
     def _agmm_kwargs(self, pins: dict | None, k: int, n: int, x: ttnn.Tensor) -> dict:
-        """The fused all-gather matmul's blocking kwargs at `x`'s per-device rows (class pin or swept table);
-        none on the unfused path, whose matmul overruns L1 with the swept blockings at long sequence lengths."""
+        """The fused all-gather matmul's blocking and compute kwargs at `x`'s per-device rows (class pin or swept
+        table); only the compute config on the unfused path, whose matmul overruns L1 with the swept blockings at
+        long sequence lengths."""
         if not self.use_fused_agmm:
-            return {}
-        return agmm_kwargs(pins, k, n, x.padded_shape[-2])
+            return {"compute_kernel_config": self.mm_compute_kernel_config}
+        return agmm_kwargs(pins, k, n, x.padded_shape[-2], self.mm_compute_kernel_config)
 
     def _ring_sdpa_program_config(self, seq_local: int) -> ttnn.SDPAProgramConfig:
         """The per-device length's class pin on the dynamic-length path, else the length-keyed table."""

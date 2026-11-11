@@ -22,6 +22,7 @@ these shapes need an entry rather than falling back.
 from __future__ import annotations
 
 import math
+import os
 from typing import NamedTuple
 
 import ttnn
@@ -109,11 +110,13 @@ AGMM_PINNED_BLOCKING: dict[tuple[int, int], dict[tuple[int, int], dict[str, tupl
 
 
 class AgmmPin(NamedTuple):
-    """Frozen all-gather-matmul program of one layer: grid, blocking and orientation fixed for every M."""
+    """Frozen all-gather-matmul program of one layer: grid, blocking, orientation and compute config fixed for
+    every M. `compute_kernel_config` None keeps the caller's (fp32 dest accumulation on)."""
 
     config: ttnn.MinimalMatmulConfig
     num_workers_per_link: int
     transpose_core_grid: bool
+    compute_kernel_config: ttnn.WormholeComputeKernelConfig | None = None
 
 
 # Worker-grid orientation per layer. Blackhole 4x8: to_qkv non-transposed is 21 % faster at 15 s than the
@@ -125,9 +128,47 @@ AGMM_PINNED_TRANSPOSED: dict[tuple[int, int], dict[tuple[int, int], bool]] = {
 }
 
 
-def agmm_pins(k: int, n: int, *, full_grid: ttnn.CoreCoord, num_links: int) -> dict[str, AgmmPin]:
-    """The AGMM program of a `(K, N)` layer per length class: one worker-grid orientation at every length and
-    the class's `AGMM_PINNED_BLOCKING`; classes with the same blocking share one pin."""
+class Fp32DestOffPins(NamedTuple):
+    """A layer's pins with fp32 dest accumulation off: the 8-tile subblock and the blocking per length class."""
+
+    subblock: tuple[int, int]
+    blockings: dict[str, tuple[int, int, int]]
+
+
+# Layers whose pins run fp32 dest accumulation off, per device compute grid; they replace the layer's
+# `AGMM_PINNED_BLOCKING` entry (kept as the MINIMAX_H3_MM_FP32_DEST=1 fallback). With a 16-bit Dst a half holds 8
+# tiles instead of 4, so the subblock covers 8 output tiles and the unpacker-bound K loop issues 6 unpacks per 8
+# tile-MACs instead of 4 per 4. Partial sums between K blocks stay fp32 in L1 (packer L1 accumulation); only the
+# accumulation inside a K block is bf16.
+# Wormhole 4x8, measured per block at 4736 (short), 9184 and 13664 (long) rows/device: to_qkv (12, 7, 12) is the
+# best at both long lengths and 0.1 % behind the best at 4736, so one program serves both classes; ff1's long pin is
+# within 0.4 % of the best at both long lengths, and its short pin is 1.5 % ahead of the long one at 4736.
+AGMM_PINNED_FP32_DEST_OFF: dict[tuple[int, int], dict[tuple[int, int], Fp32DestOffPins]] = {
+    _BH_GRID: {},
+    _WH_GRID: {
+        (5376, 5376): Fp32DestOffPins((4, 2), {"short": (12, 7, 12), "long": (12, 7, 12)}),
+        (5376, 7168): Fp32DestOffPins((2, 4), {"short": (10, 7, 16), "long": (12, 7, 12)}),
+    },
+}
+
+
+def _pin_override(k: int, n: int) -> tuple[tuple[int, int, int], tuple[int, int] | None] | None:
+    """`MINIMAX_H3_AGMM_PIN_<K>_<N>="M,K,N[,subblock_h,subblock_w]"` replaces that layer's blocking at every length
+    class, for sweeping; a subblock other than 2x2 runs fp32 dest off."""
+    value = os.environ.get(f"MINIMAX_H3_AGMM_PIN_{k}_{n}")
+    if not value:
+        return None
+    fields = tuple(int(v) for v in value.split(","))
+    return fields[:3], (fields[3:5] if len(fields) == 5 else None)
+
+
+def agmm_pins(k: int, n: int, *, full_grid: ttnn.CoreCoord, num_links: int, arch) -> dict[str, AgmmPin]:
+    """The AGMM program of a `(K, N)` layer per length class: one worker-grid orientation and compute config at
+    every length and the class's blocking (`AGMM_PINNED_FP32_DEST_OFF` where the layer has one, else
+    `AGMM_PINNED_BLOCKING`); classes with the same blocking share one pin.
+
+    MINIMAX_H3_MM_FP32_DEST=1 keeps fp32 dest accumulation and the 2x2-subblock `AGMM_PINNED_BLOCKING` on every
+    layer."""
     grid_key = (full_grid.x, full_grid.y)
     if grid_key not in AGMM_PINNED_BLOCKING:
         raise ValueError(f"dynamic_length has no pinned AGMM blockings for the {grid_key} compute grid")
@@ -139,30 +180,55 @@ def agmm_pins(k: int, n: int, *, full_grid: ttnn.CoreCoord, num_links: int) -> d
     # in0 senders group along the M-parallel axis (grid.x transposed, grid.y not) into `num_links` groups.
     in0_axis = grid.x if transposed else grid.y
     workers = math.ceil(in0_axis / num_links)
+    per_class = dict(blockings[(k, n)])
+    subblock = None
+    fp32_dest_off = AGMM_PINNED_FP32_DEST_OFF[grid_key].get((k, n))
+    if fp32_dest_off is not None and os.environ.get("MINIMAX_H3_MM_FP32_DEST") != "1":
+        subblock, per_class = fp32_dest_off.subblock, dict(fp32_dest_off.blockings)
+    override = _pin_override(k, n)
+    if override is not None:
+        per_class = {cls.name: override[0] for cls in LENGTH_CLASSES}
+        subblock = None if override[1] == (2, 2) else override[1]
+    compute_kernel_config = None
+    if subblock is not None:
+        compute_kernel_config = ttnn.init_device_compute_kernel_config(
+            arch,
+            math_fidelity=ttnn.MathFidelity.HiFi2,
+            math_approx_mode=True,
+            fp32_dest_acc_en=False,
+            packer_l1_acc=True,
+        )
+    subblock_h, subblock_w = subblock or (2, 2)
     pins: dict[tuple[int, int, int], AgmmPin] = {}
-    for cls in LENGTH_CLASSES:
-        blocking = blockings[(k, n)][cls.name]
+    for blocking in per_class.values():
         if blocking not in pins:
             m_block, k_block, n_block = blocking
+            if m_block % subblock_h or n_block % subblock_w:
+                raise ValueError(
+                    f"AGMM blocking {blocking} of (K, N)={(k, n)} does not tile by {subblock_h}x{subblock_w}"
+                )
             config = ttnn.MinimalMatmulConfig(
                 M_block_size=m_block,
                 K_block_size=k_block,
                 N_block_size=n_block,
-                subblock_h=2,
-                subblock_w=2,
+                subblock_h=subblock_h,
+                subblock_w=subblock_w,
                 compute_with_storage_grid_size=grid,
             )
-            pins[blocking] = AgmmPin(config, workers, transposed)
-    return {cls.name: pins[blockings[(k, n)][cls.name]] for cls in LENGTH_CLASSES}
+            pins[blocking] = AgmmPin(config, workers, transposed, compute_kernel_config)
+    return {name: pins[blocking] for name, blocking in per_class.items()}
 
 
-def agmm_kwargs(pins: dict[str, AgmmPin] | None, k: int, n: int, rows: int) -> dict:
-    """The linear's blocking kwargs for a `(K, N)` layer at `rows` per-device rows: the length class's pin,
-    else (legacy path) the length-keyed swept table."""
+def agmm_kwargs(
+    pins: dict[str, AgmmPin] | None, k: int, n: int, rows: int, compute_kernel_config: ttnn.WormholeComputeKernelConfig
+) -> dict:
+    """The linear's blocking and compute kwargs for a `(K, N)` layer at `rows` per-device rows: the length class's
+    pin, else (legacy path) the length-keyed swept table with `compute_kernel_config`."""
     if pins is None:
-        return {"default_block_size": agmm_block_size(k, n, rows)}
+        return {"compute_kernel_config": compute_kernel_config, "default_block_size": agmm_block_size(k, n, rows)}
     pin = pins[length_class(rows).name]
     return {
+        "compute_kernel_config": pin.compute_kernel_config or compute_kernel_config,
         "matmul_config": pin.config,
         "num_workers_per_link": pin.num_workers_per_link,
         "transpose_core_grid": pin.transpose_core_grid,

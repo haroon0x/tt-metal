@@ -65,9 +65,14 @@ _SWEPT_BLOCKINGS = {
 
 _DEVICE_GRID = ttnn.CoreCoord(12, 10)
 
-# Blocking of the dynamic-length path: one config (the v2.3 rule pick over the served envelope) for
-# every M, so a length never changes the fused op's program.
-_PINNED_BLOCKING = FusedMMRSConfig(ttnn.CoreCoord(12, 8), 6, 4, 8, 2, 2, None, 1)
+# Blocking of the dynamic-length path per device compute grid: one config for every M, so a length never changes
+# the fused op's program. Blackhole 12x10: the v2.3 rule pick over the served envelope. Wormhole 8x9: an 8x7
+# matmul grid leaving 16 cores for the reduce-scatter, (M, K, N) blocks (6, 7, 8), the best fitting blocking at
+# 13664 / 13824 rows per device ((8, 7, 8) and (6, 14, 8) do not fit L1).
+_PINNED_BLOCKINGS = {
+    (12, 10): FusedMMRSConfig(ttnn.CoreCoord(12, 8), 6, 4, 8, 2, 2, None, 1),
+    (8, 9): FusedMMRSConfig(ttnn.CoreCoord(8, 7), 6, 7, 8, 2, 2, None, 1),
+}
 
 _TILE = 32
 # The swept blocking's K divisibility holds for the fixed K: K_block 2 divides K/32 = 112. The
@@ -76,8 +81,8 @@ _TILE = 32
 
 def pinned_mmrs_config(k: int, n: int, core_grid: ttnn.CoreCoord) -> FusedMMRSConfig | None:
     """The M-independent fused MM+RS blocking of ff2 on the grid it was fitted for, else None (unfused path)."""
-    if (k, n) == (_K, _N) and core_grid == _DEVICE_GRID:
-        return _PINNED_BLOCKING
+    if (k, n) == (_K, _N):
+        return _PINNED_BLOCKINGS.get((core_grid.x, core_grid.y))
     return None
 
 
